@@ -63,6 +63,7 @@ func (app *application) registerUserHandler(w http.ResponseWriter, r *http.Reque
 		app.serverErrorResponse(w, r, err)
 		return
 	}
+	print(token)
 
 	app.background(func() {
 		data := map[string]any{

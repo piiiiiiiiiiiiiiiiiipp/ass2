@@ -237,3 +237,35 @@ func TestEnableCORS(t *testing.T) {
 		}
 	}
 }
+
+func TestRateLimit(t *testing.T) {
+	app := newTestApplication(t)
+
+	// Create a mock handler for the next function in the chain.
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Create a new request with a mock IP address.
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "192.168.1.1:1234"
+
+	// Call the rate limit middleware with the mock handler.
+	app.config.limiter.enabled = true
+	app.config.limiter.rps = 1
+	app.config.limiter.burst = 1
+	handler := app.rateLimit(next)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	// Make a second request with the same IP address.
+	req2 := httptest.NewRequest("GET", "/test", nil)
+	req2.RemoteAddr = "192.168.1.1:1234"
+	handler.ServeHTTP(httptest.NewRecorder(), req2)
+
+	// Expect the second request to fail due to rate limiting.
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req2)
+	if resp.Code != http.StatusTooManyRequests {
+		t.Errorf("expected status %d; got %d", http.StatusTooManyRequests, resp.Code)
+	}
+}

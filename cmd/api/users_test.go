@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	_ "errors"
+	"greenlight.bcc/internal/data"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	"greenlight.bcc/internal/data"
 )
 
 func TestRegisterUserHandler(t *testing.T) {
