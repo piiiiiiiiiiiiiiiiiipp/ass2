@@ -140,7 +140,7 @@ func TestRequireAuthenticatedUser(t *testing.T) {
 	}
 }
 
-func TestMetricsHandler(t *testing.T) {
+func TestMetricsHandler_Disabled(t *testing.T) {
 	mockHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -362,7 +362,7 @@ func newTestApplicationWithLimit(rps float64, burst int, enabled bool) *applicat
 	}
 }
 
-func TestRateLimit_Disabled(t *testing.T) {
+func TestRateLimit(t *testing.T) {
 	app := newTestApplicationWithLimit(1, 1, false)
 	ts := httptest.NewServer(app.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
