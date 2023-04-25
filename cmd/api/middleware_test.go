@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"greenlight.bcc/internal/data"
+	"greenlight.bcc/internal/jsonlog"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -238,34 +242,228 @@ func TestEnableCORS(t *testing.T) {
 	}
 }
 
-func TestRateLimit(t *testing.T) {
+type MockedUsersModel struct {
+}
+
+func (m *MockedUsersModel) Insert(user *data.User) error {
+	return nil
+}
+
+func (m *MockedUsersModel) GetByEmail(email string) (*data.User, error) {
+	return nil, nil
+}
+func (m *MockedUsersModel) Update(user *data.User) error {
+	return nil
+}
+
+func (m *MockedUsersModel) GetForToken(tokenScope string, tokenPlaintext string) (*data.User, error) {
+	switch tokenPlaintext {
+	case "ValidTokenqwerrewwerewqqwe":
+		return &data.User{ID: 1, Activated: true}, nil
+	case "qInvalidTokenwqerqwerqwerq":
+		return nil, data.ErrRecordNotFound
+	case "qweqweqweqweqweqweqweqw321":
+		return nil, errors.New("error")
+	default:
+		return nil, data.ErrRecordNotFound
+	}
+}
+
+func TestAuthenticate(t *testing.T) {
 	app := newTestApplication(t)
 
-	// Create a mock handler for the next function in the chain.
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	})
+	}
 
-	// Create a new request with a mock IP address.
-	req := httptest.NewRequest("GET", "/test", nil)
-	req.RemoteAddr = "192.168.1.1:1234"
+	testCases := []struct {
+		name            string
+		authorization   string
+		mockGetForToken func(string, string) (*data.User, error)
+		expectedStatus  int
+	}{
+		{
+			name:          "NoAuthorizationHeader",
+			authorization: "",
+			mockGetForToken: func(scope, token string) (*data.User, error) {
+				return nil, data.ErrRecordNotFound
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:          "InvalidAuthorizationHeaderFormat",
+			authorization: "Invalid Header",
+			mockGetForToken: func(scope, token string) (*data.User, error) {
+				return nil, data.ErrRecordNotFound
+			},
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:          "InvalidAuthorizationHeaderFormat",
+			authorization: "Bearer TOKEN",
+			mockGetForToken: func(scope, token string) (*data.User, error) {
+				return nil, data.ErrRecordNotFound
+			},
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:          "InvalidAuthorizationHeaderFormat",
+			authorization: "Bearer qweqweqweqweqweqweqweqw321",
+			mockGetForToken: func(scope, token string) (*data.User, error) {
+				return nil, data.ErrRecordNotFound
+			},
+			expectedStatus: http.StatusInternalServerError,
+		},
+		{
+			name:          "InvalidToken",
+			authorization: "Bearer qInvalidTokenwqerqwerqwerq",
+			mockGetForToken: func(scope, token string) (*data.User, error) {
+				return nil, data.ErrRecordNotFound
+			},
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:          "ValidToken",
+			authorization: "Bearer ValidTokenqwerrewwerewqqwe",
+			mockGetForToken: func(scope, token string) (*data.User, error) {
+				return &data.User{ID: 1, Activated: true}, nil
+			},
+			expectedStatus: http.StatusOK,
+		},
+	}
 
-	// Call the rate limit middleware with the mock handler.
-	app.config.limiter.enabled = true
-	app.config.limiter.rps = 1
-	app.config.limiter.burst = 1
-	handler := app.rateLimit(next)
-	handler.ServeHTTP(httptest.NewRecorder(), req)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			app.models.Users = &MockedUsersModel{}
 
-	// Make a second request with the same IP address.
-	req2 := httptest.NewRequest("GET", "/test", nil)
-	req2.RemoteAddr = "192.168.1.1:1234"
-	handler.ServeHTTP(httptest.NewRecorder(), req2)
+			req, _ := http.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", tc.authorization)
+			res := httptest.NewRecorder()
 
-	// Expect the second request to fail due to rate limiting.
+			middleware := app.authenticate(http.HandlerFunc(handler))
+			middleware.ServeHTTP(res, req)
+
+			if res.Code != tc.expectedStatus {
+				t.Errorf("Expected status %d; got %d", tc.expectedStatus, res.Code)
+			}
+		})
+	}
+}
+
+func newTestApplicationWithLimit(rps float64, burst int, enabled bool) *application {
+	return &application{
+		config: config{
+			limiter: struct {
+				rps     float64
+				burst   int
+				enabled bool
+			}{rps: rps, burst: burst, enabled: enabled},
+		},
+	}
+}
+
+func TestRateLimit_Disabled(t *testing.T) {
+	app := newTestApplicationWithLimit(1, 1, false)
+	ts := httptest.NewServer(app.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "OK" {
+		t.Errorf("expected body 'OK', got %q", string(body))
+	}
+}
+
+func TestRateLimit_Enabled_Success(t *testing.T) {
+	app := newTestApplicationWithLimit(10, 2, true)
+	ts := httptest.NewServer(app.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "OK" {
+		t.Errorf("expected body 'OK', got %q", string(body))
+	}
+}
+
+func TestRateLimit_Enabled_Exceeded(t *testing.T) {
+	app := newTestApplicationWithLimit(1, 1, true)
+	ts := httptest.NewServer(app.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})))
+	defer ts.Close()
+
+	// First request should be successful
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// Second request should be rate-limited
+	resp, err = http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected status 429, got %d", resp.StatusCode)
+	}
+}
+
+func TestRateLimit_Enabled_BadRemoteAddr(t *testing.T) {
+	app := newTestApplicationWithLimit(1, 1, true)
+	app.logger = jsonlog.New(os.Stdout, jsonlog.LevelInfo)
+	ts := httptest.NewServer(app.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})))
+	defer ts.Close()
+
+	req, err := http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set an invalid RemoteAddr
+	req.RemoteAddr = "bad-address"
+
 	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req2)
-	if resp.Code != http.StatusTooManyRequests {
-		t.Errorf("expected status %d; got %d", http.StatusTooManyRequests, resp.Code)
+	app.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", resp.Code)
 	}
 }
